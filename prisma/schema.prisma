@@ -1,8 +1,18 @@
 // ============================================================
-// EVENT MARKETPLACE — MVP SCHEMA
-// Vendor-signup-first, budget-driven event scoping,
-// per-vendor bookings (no pooled/split payments at MVP),
-// Salesforce-style Lead -> Opportunity -> Account -> Closed funnel.
+// EVENT MARKETPLACE — SCHEMA (refreshed, supersedes all prior versions)
+//
+// Foundational assumptions locked in so far:
+// - Vendors belong to exactly ONE market (no cross-market offering yet)
+// - A vendor can offer multiple service categories; each category is
+//   independently verified and independently bookable
+// - Identity (KVK, ID/passport) is verified ONCE per vendor and reused
+//   across categories; insurance and category-specific docs are NOT
+//   assumed to carry over unless explicitly confirmed by admin
+// - No application reaches admin until all required documents for
+//   that category are uploaded (client + server-side gated)
+// - Bookings are single-vendor, single-package (no split/pooled
+//   payments at this stage — see Event for the multi-vendor "project")
+// - VAT rates are stored as verifiable, sourced data — never assumed
 // ============================================================
 
 datasource db {
@@ -38,16 +48,16 @@ enum EventType {
 }
 
 enum BookingStatus {
-  PLANNED               // added to event, not yet committed to payment
-  AWAITING_PAYMENT       // customer has started checkout for this booking
-  PAID                   // payment captured, awaiting vendor confirmation
-  CONFIRMED               // vendor accepted; both sides confirmed, calendar invites sent
-  CLOSED_WON              // event/booking completed successfully
-  CLOSED_LOST              // never converted from PLANNED (event abandoned)
-  CLOSED_CANCELLED_CLIENT // client cancelled per vendor's stated policy
-  CLOSED_CANCELLED_VENDOR // vendor-initiated cancellation, auto-refund + penalty
-  CLOSED_RESCHEDULED       // date changed, carried forward to a new booking
-  CLOSED_REFUNDED          // catch-all refund outside the above (goodwill/dispute)
+  PLANNED
+  AWAITING_PAYMENT
+  PAID
+  CONFIRMED
+  CLOSED_WON
+  CLOSED_LOST
+  CLOSED_CANCELLED_CLIENT
+  CLOSED_CANCELLED_VENDOR
+  CLOSED_RESCHEDULED
+  CLOSED_REFUNDED
 }
 
 enum GuestRole {
@@ -65,6 +75,8 @@ enum VendorStatusAction {
   HIDDEN
   UNHIDDEN
   SUSPENDED
+  AUTO_PAUSED    // triggered by the automated KVK compliance recheck, not a human
+  AUTO_RESUMED
 }
 
 enum PenaltyReason {
@@ -73,9 +85,53 @@ enum PenaltyReason {
 }
 
 enum PenaltyStatus {
-  PENDING       // logged, not yet deducted
-  DEDUCTED      // pulled from a future payout
-  WAIVED        // admin override
+  PENDING
+  DEDUCTED
+  WAIVED
+}
+
+// Applies to a PartnerCategory's path to becoming bookable
+enum ApplicationStatus {
+  DRAFT                 // vendor still filling in / uploading docs
+  DOCS_COMPLETE          // all required docs uploaded, not yet submitted
+  SUBMITTED               // vendor has submitted for review
+  INTERVIEW_SCHEDULED      // admin has booked a call/interview
+  IN_REVIEW                 // admin actively verifying docs/KVK/insurance
+  APPROVED                   // category is live and bookable
+  REJECTED                    // application denied
+}
+
+enum DocumentType {
+  ID_PASSPORT              // person-level identity, verified once per vendor
+  BUSINESS_REGISTRATION     // KVK or market equivalent, company-level
+  FOOD_SAFETY_PLAN            // e.g. HACCP (NL) or market equivalent
+  FOOD_AUTHORITY_REGISTRATION  // e.g. NVWA (NL) or market equivalent
+  BACKGROUND_CHECK               // e.g. VOG (NL) or market equivalent
+  OPERATING_LICENSE                // e.g. taxi/passenger transport operator licence, venue alcohol licence
+  LIABILITY_INSURANCE
+  REFERENCE_LETTER
+  PORTFOLIO_MEDIA
+  OTHER
+}
+
+enum DocumentStatus {
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+  EXPIRED
+}
+
+enum VatRateType {
+  STANDARD
+  REDUCED
+  ZERO
+  EXEMPT
+}
+
+enum VatAppliesTo {
+  B2B
+  B2C
+  BOTH
 }
 
 // ------------------------------------------------------------
@@ -90,103 +146,326 @@ model User {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  partnerProfile PartnerProfile?
-  events         Event[]
-  statusLogsMade VendorStatusLog[] @relation("AdminActor")
+  partnerProfile     PartnerProfile?
+  events             Event[]
+  statusLogsMade     VendorStatusLog[]   @relation("AdminActor")
+  documentsReviewed  VendorDocument[]    @relation("DocumentReviewer")
+  applicationsDecided VendorApplication[] @relation("ApplicationDecider")
+  placementsCurated  FeaturedPlacement[] @relation("PlacementCurator")
 }
 
 // ------------------------------------------------------------
-// VENDOR / PARTNER SIDE
+// MARKET — the foundation for multi-country expansion
+// ------------------------------------------------------------
+
+model Market {
+  id               String   @id @default(cuid())
+  countryCode      String   @unique // ISO 3166-1 alpha-2, e.g. "NL"
+  name             String
+  currency         String   // ISO 4217, e.g. "EUR"
+  language         String   // e.g. "nl", "en"
+  legalTermsVersion String  // current vendor/customer ToS version for this market
+  isActive         Boolean  @default(false)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  categoryRequirements CategoryRequirement[]
+  categoryVatRates     CategoryVatRate[]
+  partners             PartnerProfile[]
+  events               Event[]
+  placements           FeaturedPlacement[]
+}
+
+// ------------------------------------------------------------
+// VENDOR CATEGORIES + PER-MARKET REQUIREMENTS
+// ------------------------------------------------------------
+
+model VendorCategory {
+  id   String @id @default(cuid())
+  name String @unique // e.g. "CATERER", "DJ", "KIDS_ENTERTAINER", "VENUE", "OTHER"
+  slug String @unique
+
+  categoryRequirements CategoryRequirement[]
+  categoryVatRates     CategoryVatRate[]
+  partnerCategories    PartnerCategory[]
+}
+
+// What documents are required for a given category, in a given market.
+// This is the matrix that drives the vendor signup form dynamically.
+model CategoryRequirement {
+  id           String       @id @default(cuid())
+  marketId     String
+  categoryId   String
+  documentType DocumentType
+  isRequired   Boolean      @default(true)
+  notes        String?      @db.Text // e.g. "Required only if handling meat/fish/dairy"
+
+  market   Market         @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  category VendorCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([marketId, categoryId, documentType])
+}
+
+// VAT rate per market/category — stored as sourced, verifiable data.
+// Never trust a hardcoded percentage silently; always trace it.
+model CategoryVatRate {
+  id            String        @id @default(cuid())
+  marketId      String
+  categoryId    String
+  rateType      VatRateType
+  ratePercent   Decimal       @db.Decimal(5, 2)
+  appliesTo     VatAppliesTo  @default(BOTH) // B2B vs B2C can differ
+  sourceUrl     String        @db.Text        // official government source, not a blog/aggregator
+  lastVerifiedAt DateTime
+  verifiedBy    String?                        // admin/team member who checked it
+  notes         String?       @db.Text          // e.g. ambiguous classification, pending legislation
+
+  market   Market         @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  category VendorCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([marketId, categoryId, appliesTo])
+}
+
+// ------------------------------------------------------------
+// VENDOR / PARTNER
 // ------------------------------------------------------------
 
 model PartnerProfile {
-  id              String   @id @default(cuid())
-  userId          String   @unique
-  companyName     String
-  kvkNumber       String   // required — gates approval, not optional
-  vatNumber       String   // required — gates approval, not optional
-  category        String   // e.g. "CATERER", "DJ", "VENUE", "PHOTOGRAPHER"
-  stripeAccountId String?  // populated once Stripe Connect onboarding completes
+  id          String  @id @default(cuid())
+  userId      String  @unique
+  marketId    String
+  companyName String  // display name shown on platform
+  kvkNumber   String  // kvkNummer — company-level, verified once, reused across categories
+  vatNumber   String  // required — company-level, verified once, reused across categories
 
-  hasLiabilityInsurance Boolean @default(false)
-  insuranceDocUrl       String?
+  // Fields named to match the KVK Basisprofiel API response shape directly,
+  // so manual entry today can be swapped for an automated lookup later
+  // without renaming anything or touching downstream logic.
+  tradeName     String  // handelsnaam — official registered trade name per KVK
+  statutoryName String? // statutaireNaam — official statutory name, if different from trade name
+  legalForm     String? // rechtsvorm — e.g. "Eenmanszaak", "B.V."
 
-  isApproved Boolean @default(false) // admin-gated: can list packages
-  isVisible  Boolean @default(true)  // approved-but-hidden distinct from never-approved
+  kvkVerified       Boolean   @default(false) // true once admin manually confirms against KVK
+  kvkVerifiedAt     DateTime?
+  kvkVerifiedBy     String?
+  kvkLastCheckedAt  DateTime? // last time the compliance recheck ran against this profile
+
+  stripeAccountId String?
+
+  isVisible Boolean @default(true) // admin toggle — approved-but-hidden, e.g. paused for marketing reasons
+
+  // Automated compliance pause — distinct from isVisible. Triggered by the
+  // periodic KVK recheck if registered details no longer match what's on
+  // file (e.g. trade name changed and vendor never updated their profile).
+  isPaused     Boolean   @default(false)
+  pausedReason String?   @db.Text
+  pausedAt     DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
-  packages        Package[]
+  market          Market            @relation(fields: [marketId], references: [id])
+  identity        PartnerIdentity?
+  categories      PartnerCategory[]
+  documents       VendorDocument[]
   statusLogs      VendorStatusLog[]
   penalties       VendorPenalty[]
   bookings        Booking[]
+  complianceChecks KvkComplianceCheck[]
 }
 
-// Audit trail for admin actions on vendor visibility/approval
-model VendorStatusLog {
-  id        String              @id @default(cuid())
-  partnerId String
-  action    VendorStatusAction
-  reason    String              @db.Text
-  adminId   String
-  createdAt DateTime            @default(now())
+// The human behind the business — verified once, reused across
+// every category this vendor applies for. Not re-collected per service.
+model PartnerIdentity {
+  id             String    @id @default(cuid())
+  partnerId      String    @unique
+  fullName       String
+  idType         String    // "PASSPORT" | "NATIONAL_ID"
+  idDocumentUrl  String
+  verified       Boolean   @default(false)
+  verifiedAt     DateTime?
+  verifiedBy     String?
 
   partner PartnerProfile @relation(fields: [partnerId], references: [id], onDelete: Cascade)
-  admin   User           @relation("AdminActor", fields: [adminId], references: [id])
+}
+
+// A vendor's offering within one service category — independently
+// verified, independently bookable. A vendor with 3 categories has
+// 3 of these, each progressing through review on its own timeline.
+model PartnerCategory {
+  id         String @id @default(cuid())
+  partnerId  String
+  categoryId String
+
+  status     ApplicationStatus @default(DRAFT)
+  isBookable Boolean           @default(false) // true only once APPROVED
+
+  // Insurance can be company-wide or category-specific — admin decides
+  // whether an existing policy already covers this service line.
+  insuranceAppliesFromExistingPolicy Boolean @default(false)
+  insuranceConfirmedBy               String?
+  insuranceConfirmedAt               DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  partner     PartnerProfile      @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  category    VendorCategory      @relation(fields: [categoryId], references: [id])
+  application VendorApplication?
+  documents   VendorDocument[]
+  packages    Package[]
+
+  @@unique([partnerId, categoryId])
+}
+
+// The review workflow/state machine for a single PartnerCategory.
+// A new category added later to an already-approved vendor gets its
+// own VendorApplication, scoped only to what that category needs.
+model VendorApplication {
+  id                String            @id @default(cuid())
+  partnerCategoryId String            @unique
+  status            ApplicationStatus @default(DRAFT)
+
+  submittedAt            DateTime?
+  interviewScheduledAt   DateTime?
+  interviewConductedBy   String?
+  interviewNotes         String?       @db.Text
+
+  kvkVerified       Boolean   @default(false)
+  kvkVerifiedAt     DateTime?
+  kvkVerifiedBy     String?
+
+  insuranceVerified   Boolean   @default(false)
+  insuranceVerifiedAt DateTime?
+  insuranceVerifiedBy String?
+
+  documentsVerified Boolean @default(false)
+
+  decisionAt       DateTime?
+  decidedById      String?
+  rejectionReason  String?   @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  partnerCategory PartnerCategory @relation(fields: [partnerCategoryId], references: [id], onDelete: Cascade)
+  decidedBy       User?           @relation("ApplicationDecider", fields: [decidedById], references: [id])
+}
+
+// Uploaded evidence. partnerCategoryId is nullable: company-level docs
+// (ID, KVK proof) are null here and live on PartnerProfile/PartnerIdentity
+// instead, while category-specific docs (HACCP plan, category insurance)
+// are scoped to one PartnerCategory.
+model VendorDocument {
+  id                String         @id @default(cuid())
+  partnerId         String
+  partnerCategoryId String?
+  documentType      DocumentType
+  fileUrl           String
+  status            DocumentStatus @default(PENDING_REVIEW)
+  expiresAt         DateTime?      // VOG / insurance / HACCP renewals need tracking
+  rejectionReason   String?        @db.Text
+
+  reviewedById String?
+  reviewedAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  partner         PartnerProfile   @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  partnerCategory PartnerCategory? @relation(fields: [partnerCategoryId], references: [id], onDelete: Cascade)
+  reviewedBy      User?            @relation("DocumentReviewer", fields: [reviewedById], references: [id])
+}
+
+// Log of every periodic recheck against KVK data (via Mutatieservice or
+// manual admin lookup). Logged whether or not a mismatch was found —
+// this is the audit trail proving the platform actively monitors
+// registrations, not just checks once at signup and forgets.
+model KvkComplianceCheck {
+  id        String   @id @default(cuid())
+  partnerId String
+  checkedAt DateTime @default(now())
+
+  source String // "KVK_MUTATIESERVICE" | "MANUAL_ADMIN_LOOKUP"
+
+  tradeNameOnFile  String
+  tradeNameFound   String?
+  mismatchDetected Boolean @default(false)
+  mismatchField    String? // e.g. "tradeName", "legalForm", "kvkNumber"
+
+  rawResponse Json? // full API response snapshot for audit purposes
+
+  resolvedAt DateTime?
+  resolvedBy String?
+
+  partner PartnerProfile @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+}
+
+// Audit trail for admin actions on vendor visibility/approval status,
+// as well as automated system actions (e.g. KVK compliance mismatch)
+model VendorStatusLog {
+  id               String              @id @default(cuid())
+  partnerId        String
+  action           VendorStatusAction
+  reason           String              @db.Text
+  adminId          String?             // null when triggeredBySystem is true
+  triggeredBySystem Boolean            @default(false)
+  createdAt        DateTime            @default(now())
+
+  partner PartnerProfile @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  admin   User?           @relation("AdminActor", fields: [adminId], references: [id])
 }
 
 // Ledger of penalty charges against a vendor (e.g. vendor-cancellation fee)
 model VendorPenalty {
-  id          String        @id @default(cuid())
-  partnerId   String
-  bookingId   String?       @unique
-  amount      Decimal       @db.Decimal(10, 2)
-  reason      PenaltyReason
-  status      PenaltyStatus @default(PENDING)
-  createdAt   DateTime      @default(now())
-  resolvedAt  DateTime?
+  id         String        @id @default(cuid())
+  partnerId  String
+  bookingId  String?       @unique
+  amount     Decimal       @db.Decimal(10, 2)
+  reason     PenaltyReason
+  status     PenaltyStatus @default(PENDING)
+  createdAt  DateTime      @default(now())
+  resolvedAt DateTime?
 
   partner PartnerProfile @relation(fields: [partnerId], references: [id], onDelete: Cascade)
   booking Booking?        @relation(fields: [bookingId], references: [id])
 }
 
 // ------------------------------------------------------------
-// PACKAGES, TAGS, CANCELLATION POLICY
+// PACKAGES, TAGS, CANCELLATION POLICY, CURATION
 // ------------------------------------------------------------
 
 model Package {
-  id          String   @id @default(cuid())
-  partnerId   String
-  title       String
-  description String   @db.Text
-  basePrice   Decimal  @db.Decimal(10, 2)
-  maxGuests   Int
-  mediaUrls   String[]
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id                String   @id @default(cuid())
+  partnerCategoryId String   // bookability inherits from the category's approval, not the vendor overall
+  title             String
+  description       String   @db.Text
+  basePrice         Decimal  @db.Decimal(10, 2)
+  maxGuests         Int
+  mediaUrls         String[]
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
 
-  partner            PartnerProfile      @relation(fields: [partnerId], references: [id], onDelete: Cascade)
-  tagMappings        PackageTag[]
-  bookings           Booking[]
-  cancellationPolicy CancellationPolicy?
+  partnerCategory     PartnerCategory     @relation(fields: [partnerCategoryId], references: [id], onDelete: Cascade)
+  tagMappings         PackageTag[]
+  bookings            Booking[]
+  cancellationPolicy  CancellationPolicy?
+  featuredPlacements  FeaturedPlacement[]
 }
 
 // Vendor-defined commercial terms — structured, not free text,
 // so refunds can eventually be calculated automatically.
 model CancellationPolicy {
-  id        String      @id @default(cuid())
-  packageId String      @unique
+  id        String @id @default(cuid())
+  packageId String @unique
 
-  depositType         DepositType
+  depositType        DepositType
   depositValue        Decimal     @db.Decimal(10, 2) // flat amount OR percentage, per depositType
   depositDescription  String      @db.Text            // vendor's own language, shown at checkout
-  // e.g. "covers ingredient costs", "secures the date"
 
-  // Simple tiered refund rule set. Kept flexible via JSON for MVP;
-  // can be normalized into its own model once patterns stabilize.
+  // Kept flexible via JSON for MVP; normalize once real patterns emerge.
   refundTiers Json
   // e.g. [{ "daysBeforeEvent": 14, "refundPercent": 100 },
   //       { "daysBeforeEvent": 7,  "refundPercent": 50  },
@@ -198,9 +477,10 @@ model CancellationPolicy {
   package Package @relation(fields: [packageId], references: [id], onDelete: Cascade)
 }
 
+// Vendor's own self-tagging — used for discovery/search
 model Tag {
   id       String       @id @default(cuid())
-  name     String       @unique // e.g. "Winter", "Bachelorette", "Netherlands"
+  name     String       @unique // e.g. "Winter", "Bachelorette", "Amsterdam"
   type     String       // "SEASON" | "OCCASION" | "REGION" | "DEMOGRAPHIC" | "PRICE_TIER"
   packages PackageTag[]
 }
@@ -215,15 +495,37 @@ model PackageTag {
   @@id([packageId, tagId])
 }
 
+// Admin-controlled curation layer — separate from vendor self-tagging.
+// Lets admin manually feature/rank specific packages per market/region/
+// occasion for marketing campaigns, independent of vendor tagging quality.
+model FeaturedPlacement {
+  id          String   @id @default(cuid())
+  packageId   String
+  marketId    String
+  region      String
+  occasionTag String
+  priority    Int      @default(0)
+  isActive    Boolean  @default(true)
+  activeFrom  DateTime?
+  activeTo    DateTime?
+  curatedById String
+  createdAt   DateTime @default(now())
+
+  package   Package @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  market    Market  @relation(fields: [marketId], references: [id])
+  curatedBy User    @relation("PlacementCurator", fields: [curatedById], references: [id])
+}
+
 // ------------------------------------------------------------
 // EVENT (the customer's project) + BOOKINGS (per-vendor)
 // ------------------------------------------------------------
 
 model Event {
-  id         String      @id @default(cuid())
-  customerId String?     // nullable: scoping can start before account creation
-  title      String      // e.g. "Sarah's Bachelorette Party"
-  eventType  String      // occasion tag, e.g. "BACHELORETTE", "CORPORATE_CHRISTMAS"
+  id         String  @id @default(cuid())
+  customerId String? // nullable: scoping can start before account creation
+  marketId   String
+  title      String  // e.g. "Sarah's Bachelorette Party"
+  eventType  String  // occasion tag, e.g. "BACHELORETTE", "CORPORATE_CHRISTMAS"
   eventDate  DateTime
   region     String
   guestCount Int
@@ -233,20 +535,21 @@ model Event {
   payingGuestCount Int?     // how many people are contributing financially
 
   status EventStatus @default(LEAD)
-  type   EventType   @default(SINGLE_VENDOR) // auto-set once 2nd booking added
+  type   EventType   @default(SINGLE_VENDOR) // updated in app logic once 2nd booking is added
 
   shareToken String  @unique @default(cuid()) // view-only public link
-  isPublic   Boolean @default(true)           // controls whether shareToken is browsable
+  isPublic   Boolean @default(true)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   customer User?     @relation(fields: [customerId], references: [id])
+  market   Market    @relation(fields: [marketId], references: [id])
   bookings Booking[]
 }
 
 model Booking {
-  id        String        @id @default(cuid())
+  id        String @id @default(cuid())
   eventId   String
   packageId String
   partnerId String
@@ -257,19 +560,26 @@ model Booking {
   currency  String   @default("EUR")
 
   stripePaymentIntentId String?
-  stripeTransferId      String? // set once payout to vendor is released (post reserve window)
+  stripeTransferId      String? // set once payout to vendor is released
 
-  // Reserve/holdback mechanics — funds aren't released to vendor
-  // immediately on PAID, enabling automatic penalty enforcement.
+  // Optional — for VAT invoice purposes only. Never used to gate checkout
+  // or alter pricing: the VAT rate is fixed per category/market regardless
+  // of buyer type. A business buyer can later reclaim this VAT on their
+  // own return using the invoice these fields populate.
+  buyerCompanyName String?
+  buyerVatNumber   String?
+
+  // Reserve/holdback: funds aren't released to vendor immediately on PAID,
+  // which is what makes automatic penalty enforcement on cancellation possible.
   payoutReleaseAt DateTime?
   payoutReleased  Boolean   @default(false)
 
   vendorConfirmedAt      DateTime?
   vendorResponseDeadline DateTime? // 24-48h window after PAID
 
-  rescheduledFromId String?  @unique // self-relation for CLOSED_RESCHEDULED chains
-  rescheduledFrom    Booking? @relation("BookingReschedule", fields: [rescheduledFromId], references: [id])
-  rescheduledTo      Booking? @relation("BookingReschedule")
+  rescheduledFromId String?  @unique
+  rescheduledFrom   Booking? @relation("BookingReschedule", fields: [rescheduledFromId], references: [id])
+  rescheduledTo     Booking? @relation("BookingReschedule")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -280,6 +590,36 @@ model Booking {
 
   guests        BookingGuest[]
   vendorPenalty VendorPenalty?
+  invoice       Invoice?
+}
+
+// One invoice per Booking, issued from the vendor (seller of record) to
+// the buyer. Rate is snapshotted from CategoryVatRate at time of booking —
+// never recalculated retroactively if the rate changes later. Buyer VAT/
+// company fields are populated only if the buyer opted to supply them;
+// they affect invoice content only, never the rate or the price charged.
+model Invoice {
+  id        String   @id @default(cuid())
+  bookingId String   @unique
+
+  sellerPartnerId   String   // the vendor — legal seller of record, not the platform
+  sellerCompanyName String
+  sellerVatNumber   String
+
+  buyerCompanyName String? // copied from Booking at issue time, snapshot not live reference
+  buyerVatNumber   String?
+
+  netAmount   Decimal     @db.Decimal(10, 2)
+  vatRateType VatRateType
+  vatPercent  Decimal     @db.Decimal(5, 2)
+  vatAmount   Decimal     @db.Decimal(10, 2)
+  grossAmount Decimal     @db.Decimal(10, 2)
+
+  vatRateSourceUrl String @db.Text // traceability back to the CategoryVatRate this was snapshotted from
+
+  issuedAt DateTime @default(now())
+
+  booking Booking @relation(fields: [bookingId], references: [id])
 }
 
 // Lead booker + attendees, so vendor and platform have full contact visibility
@@ -294,3 +634,4 @@ model BookingGuest {
 
   @@unique([bookingId, email])
 }
+
